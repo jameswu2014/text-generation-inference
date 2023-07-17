@@ -1,9 +1,13 @@
 use clap::{Parser, ValueEnum};
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{mpsc, Arc};
@@ -11,7 +15,6 @@ use std::thread;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use std::{fs, io};
-use subprocess::{ExitStatus, Popen, PopenConfig, PopenError, Redirection};
 
 mod env_runtime;
 
@@ -71,6 +74,11 @@ struct Args {
     /// on the hub. You can use a specific commit id or a branch like `refs/pr/2`.
     #[clap(long, env)]
     revision: Option<String>,
+
+    /// The number of tokenizer workers used for payload validation and truncation inside the
+    /// router.
+    #[clap(default_value = "2", long, env)]
+    validation_workers: usize,
 
     /// Whether to shard the model across multiple GPUs
     /// By default text-generation-inference will use all available GPUs to run
@@ -306,11 +314,12 @@ fn shard_manager(
     let uds_string = format!("{uds_path}-{rank}");
     let uds = Path::new(&uds_string);
     // Clean previous runs
-    fs::remove_file(uds).unwrap_or_default();
+    if uds.exists() {
+        fs::remove_file(uds).unwrap();
+    }
 
     // Process args
-    let mut shard_argv = vec![
-        "text-generation-server".to_string(),
+    let mut shard_args = vec![
         "serve".to_string(),
         model_id,
         "--uds-path".to_string(),
@@ -322,77 +331,77 @@ fn shard_manager(
 
     // Activate trust remote code
     if trust_remote_code {
-        shard_argv.push("--trust-remote-code".to_string());
+        shard_args.push("--trust-remote-code".to_string());
     }
 
     // Activate tensor parallelism
     if world_size > 1 {
-        shard_argv.push("--sharded".to_string());
+        shard_args.push("--sharded".to_string());
     }
 
     if let Some(quantize) = quantize {
-        shard_argv.push("--quantize".to_string());
-        shard_argv.push(quantize.to_string())
+        shard_args.push("--quantize".to_string());
+        shard_args.push(quantize.to_string())
     }
 
     if let Some(dtype) = dtype {
-        shard_argv.push("--dtype".to_string());
-        shard_argv.push(dtype.to_string())
+        shard_args.push("--dtype".to_string());
+        shard_args.push(dtype.to_string())
     }
 
     // Model optional revision
     if let Some(revision) = revision {
-        shard_argv.push("--revision".to_string());
-        shard_argv.push(revision)
+        shard_args.push("--revision".to_string());
+        shard_args.push(revision)
     }
 
     // OpenTelemetry
     if let Some(otlp_endpoint) = otlp_endpoint {
-        shard_argv.push("--otlp-endpoint".to_string());
-        shard_argv.push(otlp_endpoint);
+        shard_args.push("--otlp-endpoint".to_string());
+        shard_args.push(otlp_endpoint);
     }
 
     // Copy current process env
-    let mut env: Vec<(OsString, OsString)> = env::vars_os().collect();
+    let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
 
     // Use cuda allocator. It leads to less memory fragmentation
-    env.push((
+    envs.push((
         "PYTORCH_CUDA_ALLOC_CONF".into(),
         "backend:cudaMallocAsync".into(),
     ));
 
     // Torch Distributed Env vars
-    env.push(("RANK".into(), rank.to_string().into()));
-    env.push(("WORLD_SIZE".into(), world_size.to_string().into()));
-    env.push(("MASTER_ADDR".into(), master_addr.into()));
-    env.push(("MASTER_PORT".into(), master_port.to_string().into()));
-    env.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
+    envs.push(("RANK".into(), rank.to_string().into()));
+    envs.push(("WORLD_SIZE".into(), world_size.to_string().into()));
+    envs.push(("MASTER_ADDR".into(), master_addr.into()));
+    envs.push(("MASTER_PORT".into(), master_port.to_string().into()));
+    envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
 
     // Safetensors load fast
-    env.push(("SAFETENSORS_FAST_GPU".into(), "1".into()));
+    envs.push(("SAFETENSORS_FAST_GPU".into(), "1".into()));
 
     // Enable hf transfer for insane download speeds
     let enable_hf_transfer = env::var("HF_HUB_ENABLE_HF_TRANSFER").unwrap_or("1".to_string());
-    env.push((
+    envs.push((
         "HF_HUB_ENABLE_HF_TRANSFER".into(),
         enable_hf_transfer.into(),
     ));
 
     // Parse Inference API token
     if let Ok(api_token) = env::var("HF_API_TOKEN") {
-        env.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
+        envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
 
     // If huggingface_hub_cache is some, pass it to the shard
     // Useful when running inside a docker container
     if let Some(huggingface_hub_cache) = huggingface_hub_cache {
-        env.push(("HUGGINGFACE_HUB_CACHE".into(), huggingface_hub_cache.into()));
+        envs.push(("HUGGINGFACE_HUB_CACHE".into(), huggingface_hub_cache.into()));
     };
 
     // If weights_cache_override is some, pass it to the shard
     // Useful when running inside a HuggingFace Inference Endpoint
     if let Some(weights_cache_override) = weights_cache_override {
-        env.push((
+        envs.push((
             "WEIGHTS_CACHE_OVERRIDE".into(),
             weights_cache_override.into(),
         ));
@@ -400,41 +409,38 @@ fn shard_manager(
 
     // If disable_custom_kernels is true, pass it to the shard as an env var
     if disable_custom_kernels {
-        env.push(("DISABLE_CUSTOM_KERNELS".into(), "True".into()))
+        envs.push(("DISABLE_CUSTOM_KERNELS".into(), "True".into()))
     }
 
     // Watermark Gamma
     if let Some(watermark_gamma) = watermark_gamma {
-        env.push(("WATERMARK_GAMMA".into(), watermark_gamma.to_string().into()))
+        envs.push(("WATERMARK_GAMMA".into(), watermark_gamma.to_string().into()))
     }
 
     // Watermark Delta
     if let Some(watermark_delta) = watermark_delta {
-        env.push(("WATERMARK_DELTA".into(), watermark_delta.to_string().into()))
+        envs.push(("WATERMARK_DELTA".into(), watermark_delta.to_string().into()))
     }
 
     // Start process
     tracing::info!("Starting shard {rank}");
-    let mut p = match Popen::create(
-        &shard_argv,
-        PopenConfig {
-            stdout: Redirection::Pipe,
-            stderr: Redirection::Pipe,
-            // Needed for the shutdown procedure
-            setpgid: true,
-            // NCCL env vars
-            env: Some(env),
-            ..Default::default()
-        },
-    ) {
+    let mut p = match Command::new("text-generation-server")
+        .args(shard_args)
+        .envs(envs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+    {
         Ok(p) => p,
         Err(err) => {
-            if let PopenError::IoError(ref err) = err {
-                if err.kind() == io::ErrorKind::NotFound {
-                    tracing::error!("text-generation-server not found in PATH");
-                    tracing::error!("Please install it with `make install-server`")
-                }
+            if err.kind() == io::ErrorKind::NotFound {
+                tracing::error!("text-generation-server not found in PATH");
+                tracing::error!("Please install it with `make install-server`")
+            } else {
+                tracing::error!("{}", err);
             }
+
             status_sender
                 .send(ShardStatus::Failed((rank, Some(err.to_string()))))
                 .unwrap();
@@ -462,7 +468,7 @@ fn shard_manager(
     let mut wait_time = Instant::now();
     loop {
         // Process exited
-        if let Some(exit_status) = p.poll() {
+        if let Some(exit_status) = p.try_wait().unwrap() {
             // We read stderr in another thread as it seems that `read_to_string` can block
             // indefinitely in some cases
             let (err_sender, err_receiver) = mpsc::channel();
@@ -480,7 +486,7 @@ fn shard_manager(
                 })
                 .ok();
 
-            if let ExitStatus::Signaled(signal) = exit_status {
+            if let Some(signal) = exit_status.signal() {
                 tracing::error!("Shard process was signaled to shutdown with signal {signal}");
             }
 
@@ -493,7 +499,7 @@ fn shard_manager(
         // We received a shutdown signal
         if shutdown.load(Ordering::SeqCst) {
             p.kill().unwrap();
-            let _ = p.wait_timeout(Duration::from_secs(90));
+            let _ = p.wait();
             tracing::info!("Shard {rank} terminated");
             return;
         }
@@ -573,7 +579,10 @@ impl PythonLogMessage {
     }
 }
 
-fn find_num_shards(sharded: Option<bool>, num_shard: Option<usize>) -> usize {
+fn find_num_shards(
+    sharded: Option<bool>,
+    num_shard: Option<usize>,
+) -> Result<usize, LauncherError> {
     // get the number of shards given `sharded` and `num_shard`
     let num_shard = match (sharded, num_shard) {
         (Some(true), None) => {
@@ -582,14 +591,18 @@ fn find_num_shards(sharded: Option<bool>, num_shard: Option<usize>) -> usize {
             let n_devices = num_cuda_devices()
                 .expect("--num-shard and CUDA_VISIBLE_DEVICES/NVIDIA_VISIBLE_DEVICES are not set");
             if n_devices <= 1 {
-                panic!("`sharded` is true but only found {n_devices} CUDA devices");
+                return Err(LauncherError::NotEnoughCUDADevices(format!(
+                    "`sharded` is true but only found {n_devices} CUDA devices"
+                )));
             }
             n_devices
         }
         (Some(true), Some(num_shard)) => {
             // we can't have only one shard while sharded
             if num_shard <= 1 {
-                panic!("`sharded` is true but `num_shard` <= 1");
+                return Err(LauncherError::ArgumentValidation(
+                    "`sharded` is true but `num_shard` <= 1".to_string(),
+                ));
             }
             num_shard
         }
@@ -599,13 +612,17 @@ fn find_num_shards(sharded: Option<bool>, num_shard: Option<usize>) -> usize {
         (None, Some(num_shard)) => num_shard,
     };
     if num_shard < 1 {
-        panic!("`num_shard` cannot be < 1");
+        return Err(LauncherError::ArgumentValidation(
+            "`num_shard` cannot be < 1".to_string(),
+        ));
     }
-    num_shard
+    Ok(num_shard)
 }
 
 #[derive(Debug)]
 enum LauncherError {
+    ArgumentValidation(String),
+    NotEnoughCUDADevices(String),
     DownloadError,
     ShardCannotStart,
     ShardDisconnected,
@@ -615,8 +632,7 @@ enum LauncherError {
 }
 
 fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), LauncherError> {
-    let mut download_argv = vec![
-        "text-generation-server".to_string(),
+    let mut download_args = vec![
         "download-weights".to_string(),
         args.model_id.to_string(),
         "--extension".to_string(),
@@ -628,35 +644,35 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
 
     // Model optional revision
     if let Some(revision) = &args.revision {
-        download_argv.push("--revision".to_string());
-        download_argv.push(revision.to_string())
+        download_args.push("--revision".to_string());
+        download_args.push(revision.to_string())
     }
 
     // Copy current process env
-    let mut env: Vec<(OsString, OsString)> = env::vars_os().collect();
+    let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
 
     // If huggingface_hub_cache is set, pass it to the download process
     // Useful when running inside a docker container
     if let Some(ref huggingface_hub_cache) = args.huggingface_hub_cache {
-        env.push(("HUGGINGFACE_HUB_CACHE".into(), huggingface_hub_cache.into()));
+        envs.push(("HUGGINGFACE_HUB_CACHE".into(), huggingface_hub_cache.into()));
     };
 
     // Enable hf transfer for insane download speeds
     let enable_hf_transfer = env::var("HF_HUB_ENABLE_HF_TRANSFER").unwrap_or("1".to_string());
-    env.push((
+    envs.push((
         "HF_HUB_ENABLE_HF_TRANSFER".into(),
         enable_hf_transfer.into(),
     ));
 
     // Parse Inference API token
     if let Ok(api_token) = env::var("HF_API_TOKEN") {
-        env.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
+        envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
 
     // If args.weights_cache_override is some, pass it to the download process
     // Useful when running inside a HuggingFace Inference Endpoint
     if let Some(weights_cache_override) = &args.weights_cache_override {
-        env.push((
+        envs.push((
             "WEIGHTS_CACHE_OVERRIDE".into(),
             weights_cache_override.into(),
         ));
@@ -664,25 +680,21 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
 
     // Start process
     tracing::info!("Starting download process.");
-    let mut download_process = match Popen::create(
-        &download_argv,
-        PopenConfig {
-            stdout: Redirection::Pipe,
-            stderr: Redirection::Pipe,
-            // Needed for the shutdown procedure
-            setpgid: true,
-            env: Some(env),
-            ..Default::default()
-        },
-    ) {
+    let mut download_process = match Command::new("text-generation-server")
+        .args(download_args)
+        .envs(envs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+    {
         Ok(p) => p,
         Err(err) => {
-            if let PopenError::IoError(ref err) = err {
-                if err.kind() == io::ErrorKind::NotFound {
-                    tracing::error!("text-generation-server not found in PATH");
-                    tracing::error!("Please install it with `make install-server`")
-                }
+            if err.kind() == io::ErrorKind::NotFound {
+                tracing::error!("text-generation-server not found in PATH");
+                tracing::error!("Please install it with `make install-server`")
             }
+
             return Err(LauncherError::DownloadError);
         }
     };
@@ -702,50 +714,31 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
     });
 
     loop {
-        if let Some(status) = download_process.poll() {
-            match status {
-                ExitStatus::Exited(exit_code) => {
-                    if exit_code == 0 {
-                        tracing::info!("Successfully downloaded weights.");
-                        break;
-                    } else {
-                        let mut err = String::new();
-                        download_process
-                            .stderr
-                            .take()
-                            .unwrap()
-                            .read_to_string(&mut err)
-                            .unwrap();
-                        tracing::error!("Download encountered an error: {err}");
-                        return Err(LauncherError::DownloadError);
-                    }
-                }
-                ExitStatus::Signaled(signal) => {
-                    let mut err = String::new();
-                    download_process
-                        .stderr
-                        .take()
-                        .unwrap()
-                        .read_to_string(&mut err)
-                        .unwrap();
-                    tracing::error!(
-                        "Download process was signaled to shutdown with signal {signal}: {err}"
-                    );
-                    return Err(LauncherError::DownloadError);
-                }
-                e => {
-                    tracing::error!("Download process exited with an unknown status.: {e:?}");
-                    return Err(LauncherError::DownloadError);
-                }
+        if let Some(status) = download_process.try_wait().unwrap() {
+            if status.success() {
+                tracing::info!("Successfully downloaded weights.");
+                break;
             }
+
+            let mut err = String::new();
+            download_process
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut err)
+                .unwrap();
+            if let Some(signal) = status.signal() {
+                tracing::error!(
+                    "Download process was signaled to shutdown with signal {signal}: {err}"
+                );
+            } else {
+                tracing::error!("Download encountered an error: {err}");
+            }
+
+            return Err(LauncherError::DownloadError);
         }
         if !running.load(Ordering::SeqCst) {
-            download_process.terminate().unwrap();
-            tracing::info!("Waiting for download process to gracefully shutdown");
-            download_process
-                .wait_timeout(Duration::from_secs(90))
-                .unwrap();
-            tracing::info!("Download process terminated");
+            terminate("download", download_process, Duration::from_secs(10)).unwrap();
             return Ok(());
         }
         sleep(Duration::from_millis(100));
@@ -764,16 +757,6 @@ fn spawn_shards(
     status_sender: mpsc::Sender<ShardStatus>,
     running: Arc<AtomicBool>,
 ) -> Result<(), LauncherError> {
-    if args.trust_remote_code {
-        tracing::warn!(
-            "`trust_remote_code` is set. Trusting that model `{}` do not contain malicious code.",
-            args.model_id
-        );
-        if args.revision.is_none() {
-            tracing::warn!("Explicitly passing a `revision` is encouraged when loading a model with custom code to ensure no malicious code has been contributed in a newer revision.");
-        }
-    }
-
     // Start shard processes
     for rank in 0..num_shard {
         let model_id = args.model_id.clone();
@@ -854,12 +837,11 @@ fn spawn_webserver(
     args: Args,
     shutdown: Arc<AtomicBool>,
     shutdown_receiver: &mpsc::Receiver<()>,
-) -> Result<Popen, LauncherError> {
+) -> Result<Child, LauncherError> {
     // All shard started
     // Start webserver
     tracing::info!("Starting Webserver");
-    let mut argv = vec![
-        "text-generation-router".to_string(),
+    let mut router_args = vec![
         "--max-concurrent-requests".to_string(),
         args.max_concurrent_requests.to_string(),
         "--max-best-of".to_string(),
@@ -878,6 +860,8 @@ fn spawn_webserver(
         args.waiting_served_ratio.to_string(),
         "--max-waiting-tokens".to_string(),
         args.max_waiting_tokens.to_string(),
+        "--validation-workers".to_string(),
+        args.validation_workers.to_string(),
         "--hostname".to_string(),
         args.hostname.to_string(),
         "--port".to_string(),
@@ -890,24 +874,24 @@ fn spawn_webserver(
 
     // Model optional revision
     if let Some(ref revision) = args.revision {
-        argv.push("--revision".to_string());
-        argv.push(revision.to_string())
+        router_args.push("--revision".to_string());
+        router_args.push(revision.to_string())
     }
 
     if args.json_output {
-        argv.push("--json-output".to_string());
+        router_args.push("--json-output".to_string());
     }
 
     // OpenTelemetry
     if let Some(otlp_endpoint) = args.otlp_endpoint {
-        argv.push("--otlp-endpoint".to_string());
-        argv.push(otlp_endpoint);
+        router_args.push("--otlp-endpoint".to_string());
+        router_args.push(otlp_endpoint);
     }
 
     // CORS origins
     for origin in args.cors_allow_origin.into_iter() {
-        argv.push("--cors-allow-origin".to_string());
-        argv.push(origin);
+        router_args.push("--cors-allow-origin".to_string());
+        router_args.push(origin);
     }
 
     // Ngrok
@@ -917,50 +901,45 @@ fn spawn_webserver(
             LauncherError::WebserverCannotStart
         })?;
 
-        argv.push("--ngrok".to_string());
-        argv.push("--ngrok-authtoken".to_string());
-        argv.push(authtoken);
+        router_args.push("--ngrok".to_string());
+        router_args.push("--ngrok-authtoken".to_string());
+        router_args.push(authtoken);
 
         if let Some(domain) = args.ngrok_domain {
-            argv.push("--ngrok-domain".to_string());
-            argv.push(domain);
+            router_args.push("--ngrok-domain".to_string());
+            router_args.push(domain);
         }
 
         if let (Some(username), Some(password)) = (args.ngrok_username, args.ngrok_password) {
-            argv.push("--ngrok-username".to_string());
-            argv.push(username);
-            argv.push("--ngrok-password".to_string());
-            argv.push(password);
+            router_args.push("--ngrok-username".to_string());
+            router_args.push(username);
+            router_args.push("--ngrok-password".to_string());
+            router_args.push(password);
         }
     }
 
     // Copy current process env
-    let mut env: Vec<(OsString, OsString)> = env::vars_os().collect();
+    let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
 
     // Parse Inference API token
     if let Ok(api_token) = env::var("HF_API_TOKEN") {
-        env.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
+        envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
 
-    let mut webserver = match Popen::create(
-        &argv,
-        PopenConfig {
-            stdout: Redirection::Pipe,
-            stderr: Redirection::Pipe,
-            // Needed for the shutdown procedure
-            setpgid: true,
-            env: Some(env),
-            ..Default::default()
-        },
-    ) {
+    let mut webserver = match Command::new("text-generation-router")
+        .args(router_args)
+        .envs(envs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+    {
         Ok(p) => p,
         Err(err) => {
             tracing::error!("Failed to start webserver: {}", err);
-            if let PopenError::IoError(err) = err {
-                if err.kind() == io::ErrorKind::NotFound {
-                    tracing::error!("text-generation-router not found in PATH");
-                    tracing::error!("Please install it with `make install-router`")
-                }
+            if err.kind() == io::ErrorKind::NotFound {
+                tracing::error!("text-generation-router not found in PATH");
+                tracing::error!("Please install it with `make install-router`")
             } else {
                 tracing::error!("{}", err);
             }
@@ -987,6 +966,31 @@ fn spawn_webserver(
     Ok(webserver)
 }
 
+fn terminate(process_name: &str, mut process: Child, timeout: Duration) -> io::Result<ExitStatus> {
+    tracing::info!("Terminating {process_name}");
+
+    let terminate_time = Instant::now();
+    signal::kill(Pid::from_raw(process.id() as i32), Signal::SIGTERM).unwrap();
+
+    tracing::info!("Waiting for {process_name} to gracefully shutdown");
+
+    while terminate_time.elapsed() < timeout {
+        if let Some(status) = process.try_wait()? {
+            tracing::info!("{process_name} terminated");
+            return Ok(status);
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    tracing::info!("Killing {process_name}");
+
+    process.kill()?;
+    let exit_status = process.wait()?;
+
+    tracing::info!("{process_name} killed");
+    Ok(exit_status)
+}
+
 fn main() -> Result<(), LauncherError> {
     // Pattern match configuration
     let args = Args::parse();
@@ -1004,7 +1008,43 @@ fn main() -> Result<(), LauncherError> {
 
     tracing::info!("{:?}", args);
 
-    let num_shard = find_num_shards(args.sharded, args.num_shard);
+    // Validate args
+    if args.max_input_length >= args.max_total_tokens {
+        return Err(LauncherError::ArgumentValidation(
+            "`max_input_length` must be < `max_total_tokens`".to_string(),
+        ));
+    }
+    if args.max_input_length as u32 > args.max_batch_prefill_tokens {
+        return Err(LauncherError::ArgumentValidation(format!(
+            "`max_batch_prefill_tokens` must be >= `max_input_length`. Given: {} and {}",
+            args.max_batch_prefill_tokens, args.max_input_length
+        )));
+    }
+    if args.max_batch_prefill_tokens > args.max_batch_total_tokens {
+        return Err(LauncherError::ArgumentValidation(format!(
+            "`max_batch_prefill_tokens` must be <= `max_batch_total_tokens`. Given: {} and {}",
+            args.max_batch_prefill_tokens, args.max_batch_total_tokens
+        )));
+    }
+    if args.max_total_tokens as u32 > args.max_batch_total_tokens {
+        return Err(LauncherError::ArgumentValidation(format!(
+            "`max_total_tokens` must be <= `max_batch_total_tokens`. Given: {} and {}",
+            args.max_total_tokens, args.max_batch_total_tokens
+        )));
+    }
+    if args.validation_workers == 0 {
+        return Err(LauncherError::ArgumentValidation(
+            "`validation_workers` must be > 0".to_string(),
+        ));
+    }
+    if args.trust_remote_code {
+        tracing::warn!(
+            "`trust_remote_code` is set. Trusting that model `{}` do not contain malicious code.",
+            args.model_id
+        );
+    }
+
+    let num_shard = find_num_shards(args.sharded, args.num_shard)?;
     if num_shard > 1 {
         tracing::info!("Sharding model on {num_shard} processes");
     }
@@ -1019,6 +1059,11 @@ fn main() -> Result<(), LauncherError> {
 
     // Download and convert model weights
     download_convert_model(&args, running.clone())?;
+
+    if !running.load(Ordering::SeqCst) {
+        // Launcher was asked to stop
+        return Ok(());
+    }
 
     // Shared shutdown bool
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1065,7 +1110,7 @@ fn main() -> Result<(), LauncherError> {
             break;
         };
 
-        match webserver.poll() {
+        match webserver.try_wait().unwrap() {
             Some(_) => {
                 tracing::error!("Webserver Crashed");
                 shutdown_shards(shutdown, &shutdown_receiver);
@@ -1078,10 +1123,7 @@ fn main() -> Result<(), LauncherError> {
     }
 
     // Graceful termination
-    webserver.terminate().unwrap();
-    tracing::info!("Waiting for webserver to gracefully shutdown");
-    webserver.wait_timeout(Duration::from_secs(90)).unwrap();
-    tracing::info!("Webserver terminated");
+    terminate("webserver", webserver, Duration::from_secs(90)).unwrap();
     shutdown_shards(shutdown, &shutdown_receiver);
 
     exit_code

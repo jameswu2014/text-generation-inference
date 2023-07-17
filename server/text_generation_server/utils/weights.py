@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import List, Dict, Optional
-from safetensors import safe_open
+from safetensors import safe_open, SafetensorError
 import torch
 
 
@@ -69,7 +69,7 @@ class Weights:
         tensor = tensor.to(device=self.device)
         return tensor
 
-    def get_sharded(self, tensor_name: str, dim: int):
+    def get_partial_sharded(self, tensor_name: str, dim: int):
         filename, tensor_name = self.get_filename(tensor_name)
         world_size = self.process_group.size()
         rank = self.process_group.rank()
@@ -80,10 +80,6 @@ class Weights:
         block_size = size // world_size
         start = rank * block_size
         stop = (rank + 1) * block_size
-
-        assert (
-            size % world_size == 0
-        ), f"The choosen size {size} is not compatible with sharding on {world_size} shards"
 
         if dim == 0:
             tensor = slice_[start:stop]
@@ -97,6 +93,17 @@ class Weights:
             tensor = tensor.to(dtype=self.dtype)
         tensor = tensor.to(device=self.device)
         return tensor
+
+    def get_sharded(self, tensor_name: str, dim: int):
+        filename, tensor_name = self.get_filename(tensor_name)
+        f = self._get_handle(filename)
+        slice_ = f.get_slice(tensor_name)
+        world_size = self.process_group.size()
+        size = slice_.get_shape()[dim]
+        assert (
+            size % world_size == 0
+        ), f"The choosen size {size} is not compatible with sharding on {world_size} shards"
+        return self.get_partial_sharded(tensor_name, dim)
 
     def get_multi_weights_col(self, prefixes: List[str], quantize: str, dim: int):
         if quantize == "gptq":
@@ -120,8 +127,17 @@ class Weights:
                 torch.testing.assert_close(w2, w[0])
             g_idx = w[0]
 
-            bits = self.get_tensor("gptq_bits").item()
-            groupsize = self.get_tensor("gptq_groupsize").item()
+            try:
+                bits = self.get_tensor("gptq_bits").item()
+                groupsize = self.get_tensor("gptq_groupsize").item()
+            except (SafetensorError, RuntimeError) as e:
+                try:
+                    import os
+
+                    bits = int(os.getenv("GPTQ_BITS"))
+                    groupsize = int(os.getenv("GPTQ_GROUPSIZE"))
+                except Exception:
+                    raise e
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize)
         else:
             w = [self.get_sharded(f"{p}.weight", dim=0) for p in prefixes]
@@ -140,8 +156,17 @@ class Weights:
             scales = self.get_tensor(f"{prefix}.scales")
             g_idx = self.get_sharded(f"{prefix}.g_idx", dim=0)
 
-            bits = self.get_tensor("gptq_bits").item()
-            groupsize = self.get_tensor("gptq_groupsize").item()
+            try:
+                bits = self.get_tensor("gptq_bits").item()
+                groupsize = self.get_tensor("gptq_groupsize").item()
+            except (SafetensorError, RuntimeError) as e:
+                try:
+                    import os
+
+                    bits = int(os.getenv("GPTQ_BITS"))
+                    groupsize = int(os.getenv("GPTQ_GROUPSIZE"))
+                except Exception:
+                    raise e
 
             weight = (qweight, qzeros, scales, g_idx, bits, groupsize)
         else:

@@ -49,8 +49,8 @@ struct Args {
     master_shard_uds_path: String,
     #[clap(default_value = "bigscience/bloom", long, env)]
     tokenizer_name: String,
-    #[clap(default_value = "main", long, env)]
-    revision: String,
+    #[clap(long, env)]
+    revision: Option<String>,
     #[clap(default_value = "2", long, env)]
     validation_workers: usize,
     #[clap(long, env)]
@@ -102,17 +102,24 @@ fn main() -> Result<(), RouterError> {
     } = args;
 
     // Validate args
+    if max_input_length >= max_total_tokens {
+        return Err(RouterError::ArgumentValidation(
+            "`max_input_length` must be < `max_total_tokens`".to_string(),
+        ));
+    }
     if max_input_length as u32 > max_batch_prefill_tokens {
-        panic!("{}", format!("`max_batch_prefill_tokens` must be >= `max_input_length`. Given: {max_batch_prefill_tokens} and {max_input_length}"));
+        return Err(RouterError::ArgumentValidation(format!("`max_batch_prefill_tokens` must be >= `max_input_length`. Given: {max_batch_prefill_tokens} and {max_input_length}")));
     }
     if max_batch_prefill_tokens > max_batch_total_tokens {
-        panic!("{}", format!("`max_batch_prefill_tokens` must be <= `max_batch_total_tokens`. Given: {max_batch_prefill_tokens} and {max_batch_total_tokens}"));
+        return Err(RouterError::ArgumentValidation(format!("`max_batch_prefill_tokens` must be <= `max_batch_total_tokens`. Given: {max_batch_prefill_tokens} and {max_batch_total_tokens}")));
     }
     if max_total_tokens as u32 > max_batch_total_tokens {
-        panic!("{}", format!("`max_total_tokens` must be <= `max_batch_total_tokens`. Given: {max_total_tokens} and {max_batch_total_tokens}"));
+        return Err(RouterError::ArgumentValidation(format!("`max_total_tokens` must be <= `max_batch_total_tokens`. Given: {max_total_tokens} and {max_batch_total_tokens}")));
     }
     if validation_workers == 0 {
-        panic!("`validation_workers` must be > 0");
+        return Err(RouterError::ArgumentValidation(
+            "`validation_workers` must be > 0".to_string(),
+        ));
     }
 
     // CORS allowed origins
@@ -140,7 +147,7 @@ fn main() -> Result<(), RouterError> {
         // Download and instantiate tokenizer
         // We need to download it outside of the Tokio runtime
         let params = FromPretrainedParameters {
-            revision: revision.clone(),
+            revision: revision.clone().unwrap_or("main".to_string()),
             auth_token: authorization_token.clone(),
             ..Default::default()
         };
@@ -168,7 +175,7 @@ fn main() -> Result<(), RouterError> {
                     sha: None,
                     pipeline_tag: None,
                 },
-                false => get_model_info(&tokenizer_name, &revision, authorization_token)
+                false => get_model_info(&tokenizer_name, revision, authorization_token)
                     .await
                     .unwrap_or_else(|| {
                         tracing::warn!("Could not retrieve model info from the Hugging Face hub.");
@@ -309,9 +316,18 @@ fn init_logging(otlp_endpoint: Option<String>, json_output: bool) {
 /// get model info from the Huggingface Hub
 pub async fn get_model_info(
     model_id: &str,
-    revision: &str,
+    revision: Option<String>,
     token: Option<String>,
 ) -> Option<HubModelInfo> {
+    let revision = match revision {
+        None => {
+            tracing::warn!("`--revision` is not set");
+            tracing::warn!("We strongly advise to set it to a known supported commit.");
+            "main".to_string()
+        }
+        Some(revision) => revision,
+    };
+
     let client = reqwest::Client::new();
     // Poor man's urlencode
     let revision = revision.replace('/', "%2F");
@@ -324,13 +340,24 @@ pub async fn get_model_info(
     let response = builder.send().await.ok()?;
 
     if response.status().is_success() {
-        return serde_json::from_str(&response.text().await.ok()?).ok();
+        let hub_model_info: HubModelInfo =
+            serde_json::from_str(&response.text().await.ok()?).ok()?;
+        if let Some(sha) = &hub_model_info.sha {
+            tracing::info!(
+                "Serving revision {sha} of model {}",
+                hub_model_info.model_id
+            );
+        }
+        Some(hub_model_info)
+    } else {
+        None
     }
-    None
 }
 
 #[derive(Debug, Error)]
 enum RouterError {
+    #[error("Argument validation error: {0}")]
+    ArgumentValidation(String),
     #[error("Unable to connect to the Python model shards: {0}")]
     Connection(ClientError),
     #[error("Unable to clear the Python model shards cache: {0}")]
