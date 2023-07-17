@@ -247,6 +247,24 @@ class TensorParallelColumnLinear(SuperLayer):
         return cls.load_multi(config, [prefix], weights, bias, dim=0)
 
     @classmethod
+    def load_packed(cls, config, prefix: str, weights, bias: bool):
+        tensor_name = f"{prefix}.weight"
+        packed_tensor = weights.get_local_tensor(tensor_name)
+        #QKV
+        total_size = packed_tensor.size()[0]
+        # print(packed_tensor.size())
+        # print(total_size)
+        single_size = total_size // 3
+        q_tensor = packed_tensor[0: single_size, :]
+        k_tensor = packed_tensor[single_size: single_size * 2, :]
+        v_tensor = packed_tensor[single_size * 2 : total_size, :]
+        q_weight = weights.get_tensor_shard(q_tensor, dim = 0)
+        k_weight = weights.get_tensor_shard(k_tensor, dim = 0)
+        v_weight = weights.get_tensor_shard(v_tensor, dim = 0)
+        weight = torch.concat([q_weight, k_weight, v_weight], dim = 0)
+        return cls(get_linear(weight, None, config.quantize))
+        
+    @classmethod
     def load_multi(cls, config, prefixes: List[str], weights, bias: bool, dim: int):
         weight = weights.get_multi_weights_col(
             prefixes, quantize=config.quantize, dim=dim

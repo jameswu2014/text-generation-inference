@@ -69,30 +69,34 @@ class Weights:
         tensor = tensor.to(device=self.device)
         return tensor
 
-    def get_partial_sharded(self, tensor_name: str, dim: int):
-        filename, tensor_name = self.get_filename(tensor_name)
+    def get_local_tensor(self, tensor_name:str):
+        filename = self.get_filename(tensor_name)
+        f = self._get_handle(filename)
+        tensor = f.get_tensor(tensor_name)
+        return tensor
+
+    def get_tensor_shard(self, var, dim):
         world_size = self.process_group.size()
         rank = self.process_group.rank()
-
-        f = self._get_handle(filename)
-        slice_ = f.get_slice(tensor_name)
-        size = slice_.get_shape()[dim]
-        block_size = size // world_size
+        block_size = var.size()[dim] // world_size
         start = rank * block_size
         stop = (rank + 1) * block_size
-
         if dim == 0:
-            tensor = slice_[start:stop]
+            tensor = var[start:stop]
         elif dim == 1:
-            tensor = slice_[:, start:stop]
+            tensor = var[:, start:stop]
         else:
             raise NotImplementedError("Let's make that generic when needed")
-        # Special case for gptq which shouldn't convert
-        # u4 which are disguised as int32
         if tensor.dtype != torch.int32:
             tensor = tensor.to(dtype=self.dtype)
         tensor = tensor.to(device=self.device)
-        return tensor
+        return tensor 
+
+    def get_partial_sharded(self, tensor_name: str, dim: int):
+        filename, tensor_name = self.get_filename(tensor_name)
+        f = self._get_handle(filename)
+        slice_ = f.get_slice(tensor_name)
+        return get_tensor_shard(slice_, dim)
 
     def get_sharded(self, tensor_name: str, dim: int):
         filename, tensor_name = self.get_filename(tensor_name)
