@@ -1,5 +1,5 @@
 # Rust builder
-FROM lukemathwalker/cargo-chef:latest-rust-1.70 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.71 AS chef
 WORKDIR /usr/src
 
 ARG CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
@@ -108,6 +108,17 @@ COPY server/Makefile-flash-att-v2 Makefile
 # Build specific version of flash attention v2
 RUN make build-flash-attention-v2
 
+# Build Transformers exllama kernels
+FROM kernel-builder as exllama-kernels-builder
+
+WORKDIR /usr/src
+
+COPY server/exllama_kernels/ .
+
+
+# Build specific version of transformers
+RUN TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX" python setup.py build
+
 # Build Transformers CUDA kernels
 FROM kernel-builder as custom-kernels-builder
 
@@ -161,6 +172,8 @@ COPY --from=flash-att-v2-builder /usr/src/flash-attention-v2/build/lib.linux-x86
 
 # Copy build artifacts from custom kernels builder
 COPY --from=custom-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
+# Copy build artifacts from exllama kernels builder
+COPY --from=exllama-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
 
 # Copy builds artifacts from vllm builder
 COPY --from=vllm-builder /usr/src/vllm/build/lib.linux-x86_64-cpython-39 /opt/conda/lib/python3.9/site-packages
@@ -175,7 +188,7 @@ COPY server/Makefile server/Makefile
 RUN cd server && \
     make gen-server && \
     pip install -r requirements.txt && \
-    pip install ".[bnb, accelerate]" --no-cache-dir
+    pip install ".[bnb, accelerate, quantize]" --no-cache-dir
 
 # Install benchmarker
 COPY --from=builder /usr/src/target/release/text-generation-benchmark /usr/local/bin/text-generation-benchmark

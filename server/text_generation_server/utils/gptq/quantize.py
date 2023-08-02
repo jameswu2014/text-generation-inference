@@ -1,18 +1,14 @@
-import argparse
 import time
-import numpy as np
-import torch
 import torch.nn as nn
 import math
 import json
 import os
+import torch
+import transformers
 
 from texttable import Texttable
 from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
-import transformers
 from huggingface_hub import HfApi
-import numpy as np
-import torch
 from accelerate import init_empty_weights
 from text_generation_server.utils import initialize_torch_distributed, Weights
 from text_generation_server.utils.hub import weight_files
@@ -812,11 +808,10 @@ def load_weights_pre_hook(module_name, weights, recursive=False):
                 tensor = weights.get_tensor(tensor_name)
                 setdeepattr(module, local_param, nn.Parameter(tensor))
             else:
-                setdeepattr(
-                    module,
-                    local_param,
-                    nn.Parameter(current_tensor.to(device=torch.device("cuda:0"))),
-                )
+                tensor = current_tensor.to(device=torch.device("cuda:0"))
+                if current_tensor.requires_grad:
+                    tensor = nn.Parameter(tensor)
+                setdeepattr(module, local_param, tensor)
 
     return inner
 
@@ -864,7 +859,9 @@ def quantize(
     )
 
     with init_empty_weights():
-        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_config(
+            config, torch_dtype=torch.float16, trust_remote_code=trust_remote_code
+        )
     model = model.eval()
 
     print("LOADED model")
